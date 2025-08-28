@@ -1,0 +1,694 @@
+# เอกสารการออกแบบทางเทคนิค - ระบบบริหารจัดการงานวิจัย
+
+## 🔧 การแก้ไข
+- **บทความแนะนำ**: เฉพาะ **Admin เท่านั้น** (ไม่ใช่ Level 3 + Admin)
+
+***
+
+## 🗄️ Database Schema Design
+
+### Core Tables
+
+#### **users**
+```sql
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    username VARCHAR(100) UNIQUE NOT NULL,
+    first_name VARCHAR(100),
+    last_name VARCHAR(100),
+    level INTEGER DEFAULT 1 CHECK (level IN (1, 2, 3)),
+    is_admin BOOLEAN DEFAULT false,
+    is_active BOOLEAN DEFAULT true,
+    download_count INTEGER DEFAULT 0,
+    detailed_info_submitted BOOLEAN DEFAULT false,
+    -- Detailed info fields (filled after 5+ downloads)
+    address TEXT,
+    phone VARCHAR(20),
+    organization VARCHAR(255),
+    research_purpose TEXT,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+#### **article_types**
+```sql
+CREATE TABLE article_types (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(50) NOT NULL,
+    slug VARCHAR(50) UNIQUE NOT NULL,
+    description TEXT,
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Default data
+INSERT INTO article_types (name, slug) VALUES 
+('Article', 'article'),
+('Short Reads', 'short-reads'),
+('Full Text', 'full-text'),
+('Media', 'media');
+```
+
+#### **topics**
+```sql
+CREATE TABLE topics (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    slug VARCHAR(100) UNIQUE NOT NULL,
+    description TEXT,
+    category VARCHAR(50),
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Default data with 12 main topics
+INSERT INTO topics (name, slug, category) VALUES 
+('Media Industry', 'media-industry', 'Trends'),
+('Technology Society', 'technology-society', 'Trends'),
+('Platforms', 'platforms', 'Audience & Platform'),
+('Time Slots', 'time-slots', 'Audience & Platform'),
+-- ... (all 12 topics)
+```
+
+#### **tags**
+```sql
+CREATE TABLE tags (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    slug VARCHAR(100) UNIQUE NOT NULL,
+    usage_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+#### **articles**
+```sql
+CREATE TABLE articles (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    title VARCHAR(500) NOT NULL,
+    slug VARCHAR(500) UNIQUE NOT NULL,
+    content TEXT NOT NULL,
+    excerpt TEXT,
+    cover_image_url TEXT,
+    article_type_id INTEGER REFERENCES article_types(id),
+    access_level INTEGER DEFAULT 1 CHECK (access_level IN (1, 2, 3)),
+    status VARCHAR(20) DEFAULT 'draft' CHECK (status IN ('draft', 'published', 'suspended')),
+    is_featured BOOLEAN DEFAULT false, -- Only admins can set this
+    view_count_unique INTEGER DEFAULT 0,
+    view_count_total INTEGER DEFAULT 0,
+    share_count INTEGER DEFAULT 0,
+    favorite_count INTEGER DEFAULT 0,
+    download_count INTEGER DEFAULT 0,
+    created_by UUID REFERENCES users(id) NOT NULL,
+    published_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+#### **article_authors** (Many-to-Many)
+```sql
+CREATE TABLE article_authors (
+    article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    role VARCHAR(50) DEFAULT 'co-author',
+    added_by UUID REFERENCES users(id),
+    added_at TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (article_id, user_id)
+);
+```
+
+#### **article_topics** (Many-to-Many)
+```sql
+CREATE TABLE article_topics (
+    article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
+    topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
+    PRIMARY KEY (article_id, topic_id)
+);
+```
+
+#### **article_tags** (Many-to-Many)
+```sql
+CREATE TABLE article_tags (
+    article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
+    tag_id INTEGER REFERENCES tags(id) ON DELETE CASCADE,
+    PRIMARY KEY (article_id, tag_id)
+);
+```
+
+### File Management Tables
+
+#### **article_files**
+```sql
+CREATE TABLE article_files (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
+    file_type VARCHAR(20) CHECK (file_type IN ('pdf', 'image', 'youtube')),
+    original_name VARCHAR(255),
+    file_path TEXT, -- Supabase storage path
+    file_url TEXT, -- Public URL
+    youtube_url TEXT, -- For YouTube embeds
+    youtube_embed_id VARCHAR(20), -- YouTube video ID
+    file_size BIGINT, -- in bytes
+    mime_type VARCHAR(100),
+    download_count INTEGER DEFAULT 0,
+    uploaded_by UUID REFERENCES users(id),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+### Analytics & Tracking Tables
+
+#### **article_views**
+```sql
+CREATE TABLE article_views (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    ip_address INET NOT NULL,
+    user_agent TEXT,
+    referrer TEXT,
+    session_id VARCHAR(255),
+    view_duration INTEGER, -- seconds
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(article_id, ip_address, DATE(created_at)) -- Prevent duplicate views per IP per day
+);
+```
+
+#### **article_favorites**
+```sql
+CREATE TABLE article_favorites (
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
+    created_at TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (user_id, article_id)
+);
+```
+
+#### **download_logs**
+```sql
+CREATE TABLE download_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
+    file_id UUID REFERENCES article_files(id) ON DELETE SET NULL,
+    ip_address INET NOT NULL,
+    user_agent TEXT,
+    download_size BIGINT,
+    completed BOOLEAN DEFAULT false,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+#### **activity_logs**
+```sql
+CREATE TABLE activity_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    article_id UUID REFERENCES articles(id) ON DELETE SET NULL,
+    action VARCHAR(50) NOT NULL, -- 'create', 'update', 'delete', 'publish', etc.
+    entity_type VARCHAR(50) NOT NULL, -- 'article', 'user', 'file', etc.
+    entity_id UUID,
+    old_values JSONB,
+    new_values JSONB,
+    ip_address INET,
+    user_agent TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+#### **share_tracking**
+```sql
+CREATE TABLE share_tracking (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
+    platform VARCHAR(50), -- 'facebook', 'twitter', 'email', etc.
+    ip_address INET,
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+***
+
+## 🚀 API Endpoints Design
+
+### Authentication & Authorization
+
+#### **Auth Endpoints**
+```typescript
+// Authentication
+POST   /api/v1/auth/register          // Register new user
+POST   /api/v1/auth/login             // Login user
+POST   /api/v1/auth/logout            // Logout user
+POST   /api/v1/auth/refresh           // Refresh JWT token
+POST   /api/v1/auth/forgot-password   // Request password reset
+POST   /api/v1/auth/reset-password    // Reset password with token
+GET    /api/v1/auth/me                // Get current user info
+PUT    /api/v1/auth/profile           // Update profile
+POST   /api/v1/auth/detailed-info     // Submit detailed info (after 5+ downloads)
+```
+
+### Public Website APIs
+
+#### **Homepage & Public Content**
+```typescript
+// Homepage
+GET    /api/v1/home                   // Get homepage data (featured articles, stats)
+GET    /api/v1/articles/featured      // Get featured articles only
+GET    /api/v1/stats/public           // Public statistics
+
+// Articles - Public Access
+GET    /api/v1/articles               // List articles (with filters)
+GET    /api/v1/articles/{id}          // Get single article
+GET    /api/v1/articles/slug/{slug}   // Get article by slug
+POST   /api/v1/articles/{id}/view     // Track article view
+POST   /api/v1/articles/{id}/share    // Track article share
+```
+
+#### **Search & Filtering**
+```typescript
+// Search
+GET    /api/v1/search                 // Advanced search with filters
+GET    /api/v1/search/suggestions     // Search suggestions/autocomplete
+
+// Filter Options
+GET    /api/v1/article-types          // Get all article types
+GET    /api/v1/topics                 // Get all topics
+GET    /api/v1/tags                   // Get popular tags
+GET    /api/v1/tags/search            // Search tags
+```
+
+#### **User Interactions**
+```typescript
+// Favorites
+GET    /api/v1/user/favorites         // Get user's favorite articles
+POST   /api/v1/articles/{id}/favorite // Add to favorites
+DELETE /api/v1/articles/{id}/favorite // Remove from favorites
+
+// Download History
+GET    /api/v1/user/downloads         // Get user's download history
+POST   /api/v1/files/{id}/download    // Download file (with quota check)
+
+// User Profile & History
+GET    /api/v1/user/profile           // Get user profile
+PUT    /api/v1/user/profile           // Update user profile
+GET    /api/v1/user/activity          // Get user activity history
+```
+
+### Admin Panel APIs
+
+#### **Article Management**
+```typescript
+// CRUD Operations
+POST   /api/v1/admin/articles         // Create new article
+PUT    /api/v1/admin/articles/{id}    // Update article
+DELETE /api/v1/admin/articles/{id}    // Delete article
+GET    /api/v1/admin/articles         // List all articles (with admin filters)
+GET    /api/v1/admin/articles/{id}    // Get article with full details
+
+// Article Status Management
+PUT    /api/v1/admin/articles/{id}/status     // Change article status
+PUT    /api/v1/admin/articles/{id}/featured   // Set/unset featured
+PUT    /api/v1/admin/articles/{id}/authors    // Manage article authors
+
+// Bulk Operations
+POST   /api/v1/admin/articles/bulk-status     // Bulk status change
+POST   /api/v1/admin/articles/bulk-delete     // Bulk delete
+```
+
+#### **File Management**
+```typescript
+// File Upload & Management
+POST   /api/v1/admin/files/upload     // Upload files (with compression)
+DELETE /api/v1/admin/files/{id}       // Delete file
+GET    /api/v1/admin/files/{id}       // Get file details
+PUT    /api/v1/admin/files/{id}       // Update file details
+
+// Article File Association
+POST   /api/v1/admin/articles/{id}/files      // Associate files with article
+DELETE /api/v1/admin/articles/{id}/files/{fileId} // Remove file from article
+```
+
+#### **User Management**
+```typescript
+// User Administration
+GET    /api/v1/admin/users            // List users (with filters)
+GET    /api/v1/admin/users/{id}       // Get user details
+PUT    /api/v1/admin/users/{id}       // Update user
+PUT    /api/v1/admin/users/{id}/level // Change user level
+PUT    /api/v1/admin/users/{id}/admin // Grant/revoke admin privileges
+PUT    /api/v1/admin/users/{id}/status// Activate/suspend user
+
+// User Statistics
+GET    /api/v1/admin/users/{id}/stats // Get user statistics
+GET    /api/v1/admin/users/stats      // Get overall user statistics
+```
+
+#### **Content Management**
+```typescript
+// Categories & Tags Management
+POST   /api/v1/admin/article-types    // Create article type
+PUT    /api/v1/admin/article-types/{id} // Update article type
+DELETE /api/v1/admin/article-types/{id} // Delete article type
+
+POST   /api/v1/admin/topics           // Create topic
+PUT    /api/v1/admin/topics/{id}      // Update topic
+DELETE /api/v1/admin/topics/{id}      // Delete topic
+
+POST   /api/v1/admin/tags             // Create tag
+PUT    /api/v1/admin/tags/{id}        // Update tag
+DELETE /api/v1/admin/tags/{id}        // Delete tag
+GET    /api/v1/admin/tags/unused      // Get unused tags
+```
+
+#### **Analytics & Reports**
+```typescript
+// Analytics Dashboard
+GET    /api/v1/admin/analytics/overview       // Dashboard overview
+GET    /api/v1/admin/analytics/articles       // Article performance
+GET    /api/v1/admin/analytics/users          // User engagement
+GET    /api/v1/admin/analytics/downloads      // Download statistics
+GET    /api/v1/admin/analytics/trends         // Trending content
+
+// Activity Logs
+GET    /api/v1/admin/logs/activity           // System activity logs
+GET    /api/v1/admin/logs/downloads          // Download logs
+GET    /api/v1/admin/logs/articles/{id}      // Article-specific logs
+GET    /api/v1/admin/logs/users/{id}         // User-specific logs
+```
+
+***
+
+## 🔐 Security & Middleware Implementation
+
+### **Authentication Strategy**
+```python
+# JWT-based authentication
+class JWTManager:
+    - access_token (15 minutes)
+    - refresh_token (7 days)
+    - token_blacklist (for logout)
+    
+# Middleware stack
+1. CORS Middleware
+2. Rate Limiting Middleware
+3. Security Headers Middleware
+4. JWT Authentication Middleware
+5. Authorization Middleware
+6. Request Logging Middleware
+```
+
+### **Authorization Levels**
+```python
+# Permission decorators
+@require_auth                    # Requires login
+@require_level(level=2)         # Requires specific user level
+@require_admin                  # Requires admin privileges
+@require_author_or_admin(article_id) # Requires article authorship or admin
+
+# Access Control Matrix
+Level 1: Public articles + basic features
+Level 2: Level 1 + premium content
+Level 3: Level 2 + exclusive content
+Admin:   Full system access
+```
+
+### **Rate Limiting Strategy**
+```python
+# Different limits for different endpoints
+PUBLIC_ENDPOINTS:    100/minute per IP
+AUTH_ENDPOINTS:      10/minute per IP
+DOWNLOAD_ENDPOINTS:  20/minute per user
+ADMIN_ENDPOINTS:     200/minute per user
+UPLOAD_ENDPOINTS:    10/minute per user
+```
+
+***
+
+## 📁 File Storage & Processing
+
+### **Supabase Storage Strategy**
+```python
+# Storage buckets
+BUCKETS = {
+    'article-covers': 'public',      # Article cover images
+    'article-images': 'public',      # Content images
+    'article-pdfs': 'authenticated', # PDF files (access controlled)
+    'user-uploads': 'private',       # User uploaded files
+    'temp-uploads': 'private'        # Temporary uploads
+}
+
+# File processing pipeline
+1. Upload validation (type, size, security scan)
+2. Image compression (if > 1MB, reduce quality by 25%)
+3. Generate unique filename with UUID
+4. Store in appropriate bucket
+5. Update database with file metadata
+6. Generate signed URLs for access
+```
+
+### **Image Processing**
+```python
+# Image optimization service
+class ImageProcessor:
+    def process_upload(self, file):
+        if file.size > 1_000_000:  # 1MB
+            return self.compress_image(file, quality=0.75)
+        return file
+    
+    def generate_thumbnails(self, image):
+        # Generate multiple sizes: 150x150, 300x300, 600x400
+        pass
+```
+
+***
+
+## 🔍 Search Implementation
+
+### **Search Architecture**
+```python
+# Multi-field search with weights
+SEARCH_WEIGHTS = {
+    'title': 3.0,
+    'excerpt': 2.0,
+    'content': 1.0,
+    'author_names': 2.5,
+    'tags': 1.5
+}
+
+# Search filters
+class SearchFilters:
+    - text_query: str
+    - article_types: List[int]
+    - topics: List[int]
+    - tags: List[int]
+    - access_level: int (based on user level)
+    - status: str = 'published'
+    - date_range: Tuple[datetime, datetime]
+    - sort_by: str ('relevance', 'date_desc', 'date_asc', 'views_desc', 'views_asc')
+    - limit: int = 20
+    - offset: int = 0
+```
+
+### **Advanced Search Query**
+```sql
+-- Example search with full-text search and filters
+SELECT DISTINCT a.*,
+       ts_rank(search_vector, plainto_tsquery('english', %s)) as rank,
+       array_agg(DISTINCT t.name) as topic_names,
+       array_agg(DISTINCT tag.name) as tag_names
+FROM articles a
+LEFT JOIN article_topics at ON a.id = at.article_id
+LEFT JOIN topics t ON at.topic_id = t.id
+LEFT JOIN article_tags atag ON a.id = atag.article_id
+LEFT JOIN tags tag ON atag.tag_id = tag.id
+WHERE a.status = 'published' 
+  AND a.access_level <= %s
+  AND (search_vector @@ plainto_tsquery('english', %s) OR %s = '')
+  AND (article_type_id = ANY(%s) OR %s = '{}')
+ORDER BY rank DESC, a.created_at DESC
+LIMIT %s OFFSET %s;
+```
+
+***
+
+## 📊 Analytics & Tracking
+
+### **View Tracking System**
+```python
+# Unique view tracking
+class ViewTracker:
+    async def track_view(self, article_id, request):
+        ip = get_client_ip(request)
+        
+        # Check if already viewed today
+        existing = await check_daily_view(article_id, ip)
+        if not existing:
+            await record_unique_view(article_id, ip)
+            await increment_unique_count(article_id)
+        
+        # Always record total view
+        await record_total_view(article_id, ip)
+        await increment_total_count(article_id)
+
+# Share tracking
+class ShareTracker:
+    async def track_share(self, article_id, platform, request):
+        await record_share(article_id, platform, get_client_ip(request))
+        await increment_share_count(article_id)
+```
+
+### **Download Quota System**
+```python
+class DownloadManager:
+    async def check_download_permission(self, user_id):
+        count = await get_user_download_count(user_id)
+        user = await get_user(user_id)
+        
+        if count >= 5 and not user.detailed_info_submitted:
+            raise DownloadQuotaExceeded()
+        return True
+    
+    async def process_download(self, file_id, user_id):
+        await self.check_download_permission(user_id)
+        
+        # Generate signed URL with expiration
+        signed_url = await generate_signed_url(file_id, expires_in=3600)
+        
+        # Log download
+        await log_download(file_id, user_id)
+        await increment_download_counts(file_id, user_id)
+        
+        return signed_url
+```
+
+***
+
+## 🚀 Performance Optimization
+
+### **Database Query Optimization**
+```python
+# Focus on database-level optimizations instead of caching
+# Since Cloud Run instances are stateless and auto-scale
+
+# Efficient query patterns
+class OptimizedQueries:
+    @staticmethod
+    async def get_homepage_data():
+        # Single query to get featured articles with related data
+        query = """
+        SELECT a.*, 
+               array_agg(DISTINCT t.name) as topic_names,
+               array_agg(DISTINCT tag.name) as tag_names,
+               u.username as author_name
+        FROM articles a
+        LEFT JOIN article_topics at ON a.id = at.article_id
+        LEFT JOIN topics t ON at.topic_id = t.id
+        LEFT JOIN article_tags atag ON a.id = atag.article_id
+        LEFT JOIN tags tag ON atag.tag_id = tag.id
+        LEFT JOIN users u ON a.created_by = u.id
+        WHERE a.status = 'published' AND a.is_featured = true
+        GROUP BY a.id, u.username
+        ORDER BY a.published_at DESC
+        LIMIT 10
+        """
+    
+    @staticmethod
+    async def get_articles_with_filters(filters):
+        # Optimized search with proper indexing
+        # Use database full-text search instead of external caching
+        pass
+
+# Database connection pooling for performance
+DATABASE_POOL_CONFIG = {
+    'min_size': 5,
+    'max_size': 20,
+    'command_timeout': 30,
+    'server_settings': {
+        'application_name': 'thaipbs_research',
+    }
+}
+```
+
+### **Database Optimization**
+```sql
+-- Critical indexes
+CREATE INDEX CONCURRENTLY idx_articles_status_level 
+    ON articles(status, access_level);
+    
+CREATE INDEX CONCURRENTLY idx_articles_published_at 
+    ON articles(published_at DESC) WHERE status = 'published';
+    
+CREATE INDEX CONCURRENTLY idx_article_views_daily_unique 
+    ON article_views(article_id, ip_address, DATE(created_at));
+    
+-- Full-text search index
+ALTER TABLE articles ADD COLUMN search_vector tsvector;
+CREATE INDEX CONCURRENTLY idx_articles_search 
+    ON articles USING GIN(search_vector);
+
+-- Trigger to update search vector
+CREATE TRIGGER articles_search_update 
+    BEFORE INSERT OR UPDATE ON articles 
+    FOR EACH ROW EXECUTE FUNCTION update_search_vector();
+```
+
+***
+
+## 🏗️ Deployment Architecture
+
+### **FastAPI Application Structure**
+```
+app/
+├── api/
+│   ├── v1/
+│   │   ├── endpoints/
+│   │   │   ├── auth.py
+│   │   │   ├── articles.py
+│   │   │   ├── admin.py
+│   │   │   ├── users.py
+│   │   │   └── files.py
+│   │   └── dependencies.py
+│   └── middleware.py
+├── core/
+│   ├── config.py
+│   ├── security.py
+│   └── database.py
+├── models/
+│   ├── article.py
+│   ├── user.py
+│   └── file.py
+├── services/
+│   ├── article_service.py
+│   ├── user_service.py
+│   ├── file_service.py
+│   ├── search_service.py
+│   └── analytics_service.py
+├── utils/
+│   ├── image_processor.py
+│   ├── cache_manager.py
+│   └── validators.py
+└── main.py
+```
+
+### **Environment Configuration**
+```python
+# Production environment variables
+DATABASE_URL="postgresql://..."
+SUPABASE_URL="https://..."
+SUPABASE_KEY="..."
+JWT_SECRET_KEY="..."
+ADMIN_EMAIL="admin@example.com"
+FILE_UPLOAD_MAX_SIZE=10485760  # 10MB
+IMAGE_COMPRESSION_QUALITY=0.75
+RATE_LIMIT_ENABLED=true
+DB_POOL_MIN_SIZE=5
+DB_POOL_MAX_SIZE=20
+# REDIS_URL="redis://..."  # For future Redis implementation when needed
+```
+
+ระบบนี้ออกแบบมาเพื่อรองรับการใช้งานจริงด้วยการคำนึงถึงประสิทธิภาพ ความปลอดภัย และการขยายตัวในอนาคต พร้อมทั้งมีระบบ monitoring และ logging ที่ครบถ้วน
