@@ -1,6 +1,6 @@
 from typing import List, Optional
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status, Response
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status, Response, Request
 from fastapi.responses import FileResponse
 from pathlib import Path
 import os
@@ -11,6 +11,9 @@ from app.core.security import get_current_admin_user, get_current_user, get_opti
 from app.models.user import UserResponse
 from app.models.article import ArticleFileResponse
 from app.services.file_service import FileService
+from app.services.user_profile_service import UserProfileService
+from app.services.activity_service import ActivityService, ActivityLogger
+from app.utils.image_processor import image_processor
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -178,10 +181,11 @@ async def get_file_info(
 @router.get("/download/{file_path:path}")
 async def download_file(
     file_path: str,
+    request: Request,
     current_user: Optional[UserResponse] = Depends(get_optional_current_user),
     db = Depends(get_database)
 ):
-    """Download file (requires login for PDF files)"""
+    """Download file (requires login for PDF files) - automatically logs downloads"""
     try:
         from app.core.config import settings
         
@@ -202,11 +206,102 @@ async def download_file(
                     detail="Login required for PDF download"
                 )
         
+        # Check download quota for logged in users
+        if current_user:
+            from app.core.config import settings
+            
+            # Determine quota based on user registration status
+            if current_user.detailed_info_submitted:
+                quota_limit = settings.DOWNLOAD_QUOTA_DETAILED
+            else:
+                quota_limit = settings.DOWNLOAD_QUOTA_BASIC
+            
+            # Check if user has exceeded quota
+            if current_user.download_count >= quota_limit:
+                raise HTTPException(
+                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                    detail={
+                        "error_type": "download_quota_exceeded",
+                        "message": "คุณได้ดาวน์โหลดเกินโควต้าแล้ว กรุณาลงทะเบียนข้อมูลเพิ่มเติมเพื่อดาวน์โหลดได้ไม่จำกัด",
+                        "current_downloads": current_user.download_count,
+                        "quota_limit": quota_limit,
+                        "action_required": "complete_registration",
+                        "registration_required": not current_user.detailed_info_submitted
+                    }
+                )
+            
+            # Send warning if approaching quota (80% of limit)
+            remaining_downloads = quota_limit - current_user.download_count
+            if remaining_downloads <= max(1, quota_limit * 0.2):  # 20% remaining or 1 download left
+                logger.info(f"User {current_user.id} approaching download quota: {remaining_downloads} downloads remaining")
+        
+        # Get file info from database to get proper file_id and article_id
+        file_service = FileService(db)
+        file_info = await file_service.get_file_by_path(file_path)
+        
+        # Log download
+        try:
+            profile_service = UserProfileService(db)
+            client_ip = request.client.host if request.client else "unknown"
+            
+            # Extract file information
+            file_id = file_info.id if file_info else UUID("00000000-0000-0000-0000-000000000000")
+            article_id = file_info.article_id if file_info else None
+            file_size = full_path.stat().st_size
+            file_type = full_path.suffix.lower().replace('.', '') or 'unknown'
+            
+            await profile_service.log_file_download(
+                user_id=current_user.id if current_user else None,
+                file_id=file_id,
+                article_id=article_id,
+                file_name=full_path.name,
+                file_type=file_type,
+                file_size=file_size,
+                ip_address=client_ip
+            )
+            
+            # Also log activity
+            if current_user:
+                activity_service = ActivityService(db)
+                await ActivityLogger.log_file_download(
+                    activity_service=activity_service,
+                    file_id=file_id,
+                    article_id=article_id,
+                    user_id=current_user.id,
+                    ip_address=client_ip,
+                    user_agent=request.headers.get("user-agent")
+                )
+                
+        except Exception as log_error:
+            # Don't fail download if logging fails
+            logger.warning(f"Failed to log download: {log_error}")
+        
+        # Prepare headers with quota information
+        headers = {}
+        if current_user:
+            if current_user.detailed_info_submitted:
+                quota_limit = settings.DOWNLOAD_QUOTA_DETAILED
+            else:
+                quota_limit = settings.DOWNLOAD_QUOTA_BASIC
+                
+            remaining_downloads = quota_limit - (current_user.download_count + 1)  # +1 because this download will count
+            headers.update({
+                "X-Download-Quota-Limit": str(quota_limit),
+                "X-Download-Quota-Used": str(current_user.download_count + 1),
+                "X-Download-Quota-Remaining": str(remaining_downloads),
+                "X-Registration-Required": str(not current_user.detailed_info_submitted).lower()
+            })
+            
+            # Add warning header if approaching limit
+            if remaining_downloads <= max(1, quota_limit * 0.2):
+                headers["X-Download-Warning"] = "approaching_limit"
+        
         # Return file
         return FileResponse(
             path=full_path,
             filename=full_path.name,
-            media_type="application/octet-stream"
+            media_type="application/octet-stream",
+            headers=headers
         )
         
     except HTTPException:
@@ -272,4 +367,152 @@ async def increment_download_count(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update download count"
+        )
+
+@router.post("/covers/upload/{article_id}")
+async def upload_cover_image(
+    article_id: UUID,
+    file: UploadFile = File(...),
+    current_user: UserResponse = Depends(get_current_admin_user),
+    db = Depends(get_database)
+):
+    """Upload cover image for article (admin only)"""
+    try:
+        # Validate file type
+        if not file.content_type or not file.content_type.startswith('image/'):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only image files are allowed for cover images"
+            )
+        
+        # Validate file size (10MB limit for cover images)
+        if file.size and file.size > 10 * 1024 * 1024:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="Cover image size exceeds 10MB limit"
+            )
+        
+        # Validate image
+        file_content = await file.read()
+        image_processor.validate_image_file(file.content_type, len(file_content))
+        
+        # Process cover image
+        file_path, public_url = await image_processor.process_cover_image(
+            file_content, file.filename or "cover_image"
+        )
+        
+        # Update article with cover image URL
+        from app.services.article_service import ArticleService
+        article_service = ArticleService(db)
+        
+        # Check if article exists
+        existing_article = await article_service.get_article_detail(article_id)
+        if not existing_article:
+            # Clean up uploaded file
+            try:
+                os.remove(file_path)
+            except:
+                pass
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Article not found"
+            )
+        
+        # Update article cover image
+        from app.models.article import ArticleUpdate
+        update_data = ArticleUpdate(cover_image_url=public_url)
+        updated_article = await article_service.update_article(article_id, update_data)
+        
+        if not updated_article:
+            # Clean up uploaded file if update failed
+            try:
+                os.remove(file_path)
+            except:
+                pass
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update article with cover image"
+            )
+        
+        # Log activity
+        try:
+            activity_service = ActivityService(db)
+            await activity_service.log_activity(
+                activity_type="cover_upload",
+                user_id=current_user.id,
+                article_id=article_id,
+                description=f"Cover image uploaded: {file.filename}",
+                new_values={"cover_image_url": public_url}
+            )
+        except Exception as activity_error:
+            logger.warning(f"Failed to log cover upload activity: {activity_error}")
+        
+        return {
+            "message": "Cover image uploaded successfully",
+            "cover_image_url": public_url,
+            "file_path": file_path,
+            "article_id": article_id
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading cover image for article {article_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Cover image upload failed"
+        )
+
+@router.get("/uploads/covers/{filename}")
+async def get_cover_image(filename: str):
+    """Serve cover images"""
+    try:
+        file_path = os.path.join("uploads/covers", filename)
+        
+        if not os.path.exists(file_path):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Cover image not found"
+            )
+        
+        return FileResponse(
+            file_path,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "max-age=3600"}  # Cache for 1 hour
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error serving cover image: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to serve cover image"
+        )
+
+@router.get("/uploads/articles/{filename}")
+async def get_article_image(filename: str):
+    """Serve article images"""
+    try:
+        file_path = os.path.join("uploads/articles", filename)
+        
+        if not os.path.exists(file_path):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Article image not found"
+            )
+        
+        return FileResponse(
+            file_path,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "max-age=3600"}  # Cache for 1 hour
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error serving article image: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to serve article image"
         )

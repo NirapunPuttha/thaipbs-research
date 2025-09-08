@@ -159,21 +159,39 @@ class FileService:
             # Create directory if not exists
             file_path.parent.mkdir(parents=True, exist_ok=True)
             
-            # Process image if needed
+            # Process image if needed using ImageProcessor
             if file_type == FileType.IMAGE:
-                processed_content, processed_size = self._process_image(file_content, file.filename)
-                file_content = processed_content
-                file_size = processed_size
+                try:
+                    processed_path, processed_url = await image_processor.process_article_image(
+                        file_content, file.filename or "article_image"
+                    )
+                    # Use processed image info
+                    file_path = Path(processed_path)
+                    file_url = processed_url
+                    file_size = file_path.stat().st_size
+                    logger.info(f"Article image optimized: {file.filename} -> {processed_path}")
+                except Exception as img_error:
+                    logger.warning(f"Image optimization failed, using fallback: {img_error}")
+                    processed_content, processed_size = self._process_image(file_content, file.filename)
+                    file_content = processed_content
+                    file_size = processed_size
+                    
+                    # Save file to disk (fallback)
+                    with open(file_path, 'wb') as f:
+                        f.write(file_content)
+                    
+                    # Generate file URL (relative to upload directory)
+                    relative_path = str(file_path.relative_to(self.upload_dir))
+                    file_url = f"/api/v1/files/download/{relative_path}"
             else:
                 file_size = len(file_content)
-            
-            # Save file to disk
-            with open(file_path, 'wb') as f:
-                f.write(file_content)
-            
-            # Generate file URL (relative to upload directory)
-            relative_path = str(file_path.relative_to(self.upload_dir))
-            file_url = f"/api/v1/files/download/{relative_path}"
+                # Save file to disk (non-image files)
+                with open(file_path, 'wb') as f:
+                    f.write(file_content)
+                
+                # Generate file URL (relative to upload directory)
+                relative_path = str(file_path.relative_to(self.upload_dir))
+                file_url = f"/api/v1/files/download/{relative_path}"
             
             # Save to database
             file_record = await self._save_file_record(
@@ -220,6 +238,30 @@ class FileService:
         
         row = await self.db.fetch_one(query, file_id)
         return ArticleFileResponse(**dict(row)) if row else None
+
+    async def get_file_by_path(self, file_path: str) -> Optional[ArticleFileResponse]:
+        """Get file by file path"""
+        try:
+            query = """
+            SELECT id, article_id, file_type, original_name, file_path, file_url,
+                   youtube_url, youtube_embed_id, file_size, mime_type, 
+                   download_count, uploaded_by, created_at
+            FROM article_files
+            WHERE file_path = $1 OR file_url LIKE $2
+            """
+            
+            # Try to match both file_path directly and file_url pattern
+            url_pattern = f"%{file_path}"
+            row = await self.db.fetch_one(query, file_path, url_pattern)
+            
+            if not row:
+                return None
+                
+            return ArticleFileResponse(**dict(row))
+            
+        except Exception as e:
+            logger.error(f"Error getting file by path: {e}")
+            return None  # Return None instead of raising to not break download
     
     async def delete_article_file(self, file_id: UUID) -> bool:
         """Delete article file from database and disk"""

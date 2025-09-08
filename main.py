@@ -17,8 +17,8 @@ app = FastAPI(
     title="Thailand PBS Research Management System",
     description="A comprehensive research content management system",
     version="1.0.0",
-    docs_url="/docs" if settings.ENVIRONMENT == "development" else None,
-    redoc_url="/redoc" if settings.ENVIRONMENT == "development" else None,
+    docs_url="/docs",
+    redoc_url="/redoc",
     on_startup=[startup],
     on_shutdown=[shutdown]
 )
@@ -41,7 +41,11 @@ app.add_middleware(
 # Trusted host middleware
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=["*"] if settings.ENVIRONMENT == "development" else ["yourdomain.com"]
+    allowed_hosts=["*"] if settings.ENVIRONMENT == "development" else [
+        "yourdomain.com",
+        "thaipbs-research-333367812150.asia-southeast1.run.app",
+        "*.run.app"
+    ]
 )
 
 # Include API router

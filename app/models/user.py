@@ -10,11 +10,21 @@ class UserCreate(BaseModel):
     username: str
     first_name: Optional[str] = None
     last_name: Optional[str] = None
+    level: Optional[int] = 1  # Default to level 1 (basic user)
+    is_admin: Optional[bool] = False
+    is_creator: Optional[bool] = False
+    is_active: Optional[bool] = True
     
     @validator('password')
     def validate_password(cls, v):
         if len(v) < 8:
             raise ValueError('Password must be at least 8 characters long')
+        return v
+
+    @validator('level')
+    def validate_level(cls, v):
+        if v is not None and not 1 <= v <= 3:
+            raise ValueError('Level must be between 1 and 3')
         return v
     
     @validator('username')
@@ -39,6 +49,7 @@ class UserResponse(BaseModel):
     last_name: Optional[str]
     level: int
     is_admin: bool
+    is_creator: bool
     is_active: bool
     download_count: int
     detailed_info_submitted: bool
@@ -73,9 +84,51 @@ class UserDetailedInfo(BaseModel):
     research_purpose: str
 
 # Admin user management schema
+class UserUpdate(BaseModel):
+    email: Optional[str] = None
+    username: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    password: Optional[str] = None
+    level: Optional[int] = None
+    is_admin: Optional[bool] = None
+    is_creator: Optional[bool] = None
+    is_active: Optional[bool] = None
+
+    @validator('email')
+    def validate_email(cls, v):
+        if v is not None:
+            # Basic email validation
+            if '@' not in v or '.' not in v.split('@')[-1]:
+                raise ValueError('Invalid email format')
+        return v
+
+    @validator('username')
+    def validate_username(cls, v):
+        if v is not None:
+            if len(v) < 3:
+                raise ValueError('Username must be at least 3 characters long')
+            if not v.replace('_', '').replace('-', '').isalnum():
+                raise ValueError('Username can only contain letters, numbers, underscore and hyphen')
+        return v
+
+    @validator('password')
+    def validate_password(cls, v):
+        if v is not None:
+            if len(v) < 8:
+                raise ValueError('Password must be at least 8 characters long')
+        return v
+
+    @validator('level')
+    def validate_level(cls, v):
+        if v is not None and not 1 <= v <= 3:
+            raise ValueError('Level must be between 1 and 3')
+        return v
+
 class UserAdminUpdate(BaseModel):
     level: Optional[int] = None
     is_admin: Optional[bool] = None
+    is_creator: Optional[bool] = None
     is_active: Optional[bool] = None
     
     @validator('level')
@@ -93,6 +146,7 @@ class UserListResponse(BaseModel):
     last_name: Optional[str]
     level: int
     is_admin: bool
+    is_creator: bool
     is_active: bool
     download_count: int
     detailed_info_submitted: bool
@@ -113,3 +167,46 @@ class TokenData(BaseModel):
 
 class RefreshToken(BaseModel):
     refresh_token: str
+
+# Download history models
+class DownloadHistoryItem(BaseModel):
+    id: UUID
+    file_id: UUID
+    article_id: Optional[UUID]
+    file_name: str
+    file_type: str
+    file_size: Optional[int]
+    article_title: Optional[str]
+    downloaded_at: datetime
+    ip_address: Optional[str]
+
+class DownloadHistoryResponse(BaseModel):
+    downloads: List[DownloadHistoryItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+# User statistics models
+class UserStats(BaseModel):
+    user_id: UUID
+    total_downloads: int
+    unique_articles_downloaded: int
+    favorite_articles_count: int
+    total_article_views: int
+    recent_activity_count: int
+    most_downloaded_file_type: Optional[str]
+    registration_date: datetime
+    last_activity_date: Optional[datetime]
+    account_level: int
+
+# Complete user profile response (including stats)
+class UserProfileComplete(UserResponse):
+    # Detailed info fields (if submitted)
+    address: Optional[str] = None
+    phone: Optional[str] = None 
+    organization: Optional[str] = None
+    research_purpose: Optional[str] = None
+    
+    # Statistics
+    stats: Optional[UserStats] = None

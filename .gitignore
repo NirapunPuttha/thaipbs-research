@@ -81,3 +81,10 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+
+# Cloud Run / Docker
+.gcloud/
+cloud-run-*.yaml
+service-*.yaml
+docker-compose.override.yml
+Dockerfile.local

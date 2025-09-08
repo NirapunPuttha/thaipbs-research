@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     UPLOAD_PATH: str = os.getenv("UPLOAD_PATH", "./uploads")
     UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "./uploads")
     
+    # Download Quota
+    DOWNLOAD_QUOTA_BASIC: int = int(os.getenv("DOWNLOAD_QUOTA_BASIC", 3))  # Basic users can download 3 files max
+    DOWNLOAD_QUOTA_DETAILED: int = int(os.getenv("DOWNLOAD_QUOTA_DETAILED", 999))  # Detailed users unlimited (or high number)
+    
     # Security
     RATE_LIMIT_ENABLED: bool = os.getenv("RATE_LIMIT_ENABLED", "false").lower() == "true"
     CORS_ORIGINS: str = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")

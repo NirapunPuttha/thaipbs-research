@@ -4,7 +4,7 @@ import asyncpg
 from slugify import slugify
 from app.core.database import DatabaseManager
 from app.models.article import (
-    ArticleCreate, ArticleUpdate, ArticleResponse, ArticleDetail, 
+    ArticleCreate, ArticleCreateMinimal, ArticleUpdate, ArticleResponse, ArticleDetail, 
     ArticleListItem, ArticleSearchRequest, ArticleSearchResponse,
     ArticleAdminUpdate, ArticleStats, ArticleStatus, AccessLevel,
     ArticleTypeResponse, TopicResponse, TagResponse, ArticleFileResponse
@@ -217,7 +217,7 @@ class ArticleService:
                 param_count += 1
                 params.append(f"%{search_req.query}%")  # For ILIKE search
             
-            # Author search
+            # Author search by name
             if search_req.author_query:
                 param_count += 1
                 where_conditions.append(f"""
@@ -233,6 +233,19 @@ class ArticleService:
                 )
                 """)
                 params.append(f"%{search_req.author_query}%")
+            
+            # Author filter by specific IDs
+            if search_req.author_ids:
+                param_count += 1
+                where_conditions.append(f"""
+                (a.created_by = ANY(${param_count}) OR 
+                 EXISTS (
+                    SELECT 1 FROM article_authors aa 
+                    WHERE aa.article_id = a.id 
+                    AND aa.user_id = ANY(${param_count})
+                ))
+                """)
+                params.append(search_req.author_ids)
             
             # Article type filter
             if search_req.article_type_ids:
@@ -354,6 +367,48 @@ class ArticleService:
             
         except Exception as e:
             logger.error(f"Error getting article list: {e}")
+            raise
+
+    async def create_article_minimal(self, article_data: 'ArticleCreateMinimal', created_by: UUID) -> Optional[ArticleDetail]:
+        """Create a new article with minimal data - just type and draft content"""
+        try:
+            # Generate slug from title (or use default)
+            base_slug = slugify(article_data.title) if article_data.title != "Untitled Draft" else f"untitled-draft-{created_by}"
+            slug = await self._generate_unique_slug(base_slug)
+            
+            # Insert article with minimal data and draft status
+            article_query = """
+            INSERT INTO articles (title, slug, content, article_type_id, 
+                                access_level, is_featured, status, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING id, title, slug, content, excerpt, cover_image_url, 
+                      article_type_id, access_level, status, is_featured,
+                      view_count_unique, view_count_total, share_count, 
+                      favorite_count, download_count, created_by, 
+                      published_at, created_at, updated_at
+            """
+            
+            article_row = await self.db.fetch_one(
+                article_query,
+                article_data.title,
+                slug,
+                article_data.content,
+                article_data.article_type_id,
+                1,  # Default access_level = PUBLIC
+                False,  # Default is_featured = False
+                'draft',  # Force status to draft
+                created_by
+            )
+            
+            if not article_row:
+                return None
+            
+            # Get article detail to return complete object
+            article_id = article_row['id']
+            return await self.get_article_detail(article_id)
+            
+        except Exception as e:
+            logger.error(f"Error creating minimal article: {e}")
             raise
 
     async def update_article(self, article_id: UUID, update_data: ArticleUpdate) -> Optional[ArticleDetail]:

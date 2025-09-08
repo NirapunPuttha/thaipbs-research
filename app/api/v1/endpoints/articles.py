@@ -1,15 +1,17 @@
 from typing import List, Optional
 from uuid import UUID
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, status, Request
 from app.core.database import get_database
-from app.core.security import get_current_user, get_current_admin_user, get_optional_current_user
+from app.core.security import get_current_user, get_current_admin_user, get_current_creator_user, get_optional_current_user
 from app.models.user import UserResponse
 from app.models.article import (
-    ArticleCreate, ArticleUpdate, ArticleResponse, ArticleDetail,
+    ArticleCreate, ArticleCreateMinimal, ArticleUpdate, ArticleResponse, ArticleDetail,
     ArticleListItem, ArticleSearchRequest, ArticleSearchResponse,
     ArticleAdminUpdate, ArticleStats, ArticleStatus, AccessLevel,
     ArticleTypeResponse, TopicResponse, TagResponse
 )
+from pydantic import BaseModel
 from app.services.article_service import ArticleService
 from app.services.analytics_service import AnalyticsService
 from app.services.activity_service import ActivityService, ActivityLogger
@@ -19,47 +21,36 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Homepage endpoint (must come before article_identifier route)
-@router.get("/homepage", response_model=dict)
-async def get_homepage_articles(
-    featured_limit: int = Query(5, ge=1, le=20, description="Number of featured articles"),
-    popular_limit: int = Query(10, ge=1, le=50, description="Number of popular articles"),
-    latest_limit: int = Query(10, ge=1, le=50, description="Number of latest articles"),
+# Home endpoint - Homepage API (must come before article_identifier route)
+@router.get("/home", response_model=dict)
+async def get_home_articles(
+    featured_limit: int = Query(10, ge=1, le=20, description="Number of featured articles (default 10)"),
+    latest_limit: int = Query(10, ge=1, le=50, description="Number of latest articles (default 10)"),
     current_user: Optional[UserResponse] = Depends(get_optional_current_user),
     db = Depends(get_database)
 ):
-    """Get homepage articles with featured, popular, and latest sections"""
+    """Get home page data: featured articles (10) and latest articles (10)"""
     try:
-        from app.services.analytics_service import AnalyticsService
-        
         service = ArticleService(db)
-        analytics_service = AnalyticsService(db)
         current_user_id = current_user.id if current_user else None
         
-        # Get featured articles
+        # Get featured articles (10 first) - บทความที่ถูกตั้งค่าว่าแนะนำ 10 อันดับแรก
         featured_request = ArticleSearchRequest(
             status=ArticleStatus.PUBLISHED,
             access_level=AccessLevel.PUBLIC,
             is_featured=True,
-            sort_by="created_at",
+            sort_by="published_at",  # เรียงตามวันที่เผยแพร่
             sort_order="desc",
             page=1,
             page_size=featured_limit
         )
         featured_response = await service.get_article_list(featured_request, current_user_id)
         
-        # Get popular articles (last 30 days)
-        popular_articles = await analytics_service.get_popular_articles(
-            days=30,
-            limit=popular_limit,
-            sort_by="view_count_unique"
-        )
-        
-        # Get latest articles
+        # Get latest articles (10 first) - บทความใหม่ 10 อันดับแรก
         latest_request = ArticleSearchRequest(
             status=ArticleStatus.PUBLISHED,
             access_level=AccessLevel.PUBLIC,
-            sort_by="published_at",
+            sort_by="published_at",  # เรียงตามวันที่เผยแพร่
             sort_order="desc",
             page=1,
             page_size=latest_limit
@@ -67,22 +58,14 @@ async def get_homepage_articles(
         latest_response = await service.get_article_list(latest_request, current_user_id)
         
         return {
-            "featured": {
-                "articles": featured_response.items,
-                "total": featured_response.total
-            },
-            "popular": {
-                "articles": popular_articles,
-                "criteria": {"days": 30, "sort_by": "view_count_unique"}
-            },
-            "latest": {
-                "articles": latest_response.items,
-                "total": latest_response.total
-            }
+            "featured_articles": featured_response.items,
+            "featured_count": len(featured_response.items),
+            "latest_articles": latest_response.items,
+            "latest_count": len(latest_response.items)
         }
         
     except Exception as e:
-        logger.error(f"Error getting homepage articles: {e}")
+        logger.error(f"Error getting home articles: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error"
@@ -344,15 +327,71 @@ async def search_articles_authenticated(
             detail="Internal server error"
         )
 
-# Admin endpoints
+# Admin endpoints  
+@router.post("/quick", response_model=ArticleDetail)
+async def create_article_minimal(
+    article_data: ArticleCreateMinimal,
+    request: Request,
+    current_user: UserResponse = Depends(get_current_creator_user),
+    db = Depends(get_database)
+):
+    """Create new article quickly - just type and draft (admin or creator only)"""
+    try:
+        service = ArticleService(db)
+        article = await service.create_article_minimal(article_data, current_user.id)
+        
+        if not article:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Failed to create article"
+            )
+        
+        # Log activity
+        try:
+            activity_service = ActivityService(db)
+            client_ip = request.headers.get("x-forwarded-for") or "unknown"
+            user_agent = request.headers.get("user-agent")
+            
+            new_values = {
+                "title": article.title,
+                "status": article.status.value,
+                "access_level": article.access_level.value,
+                "article_type_id": article.article_type_id
+            }
+            
+            await ActivityLogger.log_article_create(
+                activity_service=activity_service,
+                article_id=article.id,
+                user_id=current_user.id,
+                new_values=new_values,
+                ip_address=client_ip,
+                user_agent=user_agent
+            )
+        except Exception as activity_error:
+            logger.warning(f"Failed to log create activity: {activity_error}")
+        
+        return article
+        
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        logger.error(f"Error creating minimal article: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
+
 @router.post("", response_model=ArticleDetail)
 async def create_article(
     article_data: ArticleCreate,
     request: Request,
-    current_user: UserResponse = Depends(get_current_admin_user),
+    current_user: UserResponse = Depends(get_current_creator_user),
     db = Depends(get_database)
 ):
-    """Create new article (admin only)"""
+    """Create new article with full data (admin or creator only)"""
     try:
         service = ArticleService(db)
         article = await service.create_article(article_data, current_user.id)
@@ -405,10 +444,10 @@ async def create_article(
 async def update_article(
     article_id: UUID,
     update_data: ArticleUpdate,
-    current_user: UserResponse = Depends(get_current_admin_user),
+    current_user: UserResponse = Depends(get_current_creator_user),
     db = Depends(get_database)
 ):
-    """Update article (admin only)"""
+    """Update article (admin or creator/author only)"""
     try:
         service = ArticleService(db)
         
@@ -419,6 +458,18 @@ async def update_article(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Article not found"
             )
+        
+        # Check permission: admin can edit anything, creator can edit only their own articles
+        if not current_user.is_admin:
+            # Check if user is the author or co-author
+            is_author = existing.created_by == current_user.id
+            is_co_author = any(author.get('id') == current_user.id for author in existing.authors)
+            
+            if not (is_author or is_co_author):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You can only edit articles you created or co-authored"
+                )
         
         article = await service.update_article(article_id, update_data)
         if not article:
@@ -527,6 +578,137 @@ async def get_article_admin(
             detail="Internal server error"
         )
 
+@router.get("/manage", response_model=ArticleSearchResponse)
+async def get_managed_articles(
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(20, ge=1, le=100, description="Items per page"),
+    sort_by: str = Query("created_at", description="Sort field"),
+    sort_order: str = Query("desc", regex="^(asc|desc)$", description="Sort order"),
+    
+    # Search filters
+    query: Optional[str] = Query(None, description="Search text in title, content, excerpt"),
+    author_query: Optional[str] = Query(None, description="Search by author name"),
+    
+    # Category filters
+    article_type_ids: List[int] = Query([], description="Filter by article types"),
+    topic_ids: List[int] = Query([], description="Filter by topics"),
+    tag_names: List[str] = Query([], description="Filter by tag names"),
+    
+    # Status and access filters
+    status: Optional[str] = Query(None, description="Article status (draft, published, suspended)"),
+    access_level: Optional[int] = Query(None, ge=1, le=3, description="Access level (1-3)"),
+    is_featured: Optional[bool] = Query(None, description="Filter featured articles"),
+    
+    # Date range filters
+    created_after: Optional[datetime] = Query(None, description="Created after date"),
+    created_before: Optional[datetime] = Query(None, description="Created before date"),
+    published_after: Optional[datetime] = Query(None, description="Published after date"),
+    published_before: Optional[datetime] = Query(None, description="Published before date"),
+    
+    # Authentication required
+    current_user: UserResponse = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """
+    Smart article management API:
+    - Admin: See all articles in the system (any status, any access level)
+    - User: See only articles they created/authored (any status of their own)
+    """
+    try:
+        service = ArticleService(db)
+        
+        # Convert status string to enum
+        status_enum = None
+        if status:
+            try:
+                status_enum = ArticleStatus(status)
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid status: {status}. Valid options: draft, published, suspended"
+                )
+        
+        # Convert access_level to enum
+        access_level_enum = None
+        if access_level:
+            try:
+                access_level_enum = AccessLevel(access_level)
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid access_level: {access_level}. Valid options: 1, 2, 3"
+                )
+        
+        # Build search request based on user role
+        if current_user.is_admin:
+            # 👨‍💼 Admin Mode: See everything
+            search_request = ArticleSearchRequest(
+                query=query,
+                author_query=author_query,
+                article_type_ids=article_type_ids,
+                topic_ids=topic_ids,
+                tag_names=tag_names,
+                status=status_enum,
+                access_level=access_level_enum,
+                is_featured=is_featured,
+                created_after=created_after,
+                created_before=created_before,
+                published_after=published_after,
+                published_before=published_before,
+                sort_by=sort_by,
+                sort_order=sort_order,
+                page=page,
+                page_size=page_size
+                # No restrictions for admin
+            )
+            user_role = "admin"
+            
+        else:
+            # 👤 User Mode: See only own articles
+            # Restrict some filters for non-admin users
+            filtered_status = status_enum
+            if status_enum == ArticleStatus.SUSPENDED:
+                # Users shouldn't see suspended articles (admin action)
+                filtered_status = None
+            
+            search_request = ArticleSearchRequest(
+                query=query,
+                author_query=author_query,
+                author_ids=[current_user.id],  # 🔑 Only show user's own articles
+                article_type_ids=article_type_ids,
+                topic_ids=topic_ids,
+                tag_names=tag_names,
+                status=filtered_status,
+                access_level=access_level_enum,
+                is_featured=None,  # Users can't filter by featured (admin privilege)
+                created_after=created_after,
+                created_before=created_before,
+                published_after=published_after,
+                published_before=published_before,
+                sort_by=sort_by,
+                sort_order=sort_order,
+                page=page,
+                page_size=page_size
+            )
+            user_role = "user"
+        
+        # Get articles
+        result = await service.get_article_list(search_request, current_user.id)
+        
+        # Add user role info for frontend
+        result.user_role = user_role
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting managed articles: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
+
 @router.post("/admin/search", response_model=ArticleSearchResponse)
 async def search_articles_admin(
     search_request: ArticleSearchRequest,
@@ -611,4 +793,90 @@ async def get_popular_tags(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error"
+        )
+
+
+# Article Authors Management Endpoints (for existing article_authors table)
+class AddAuthorRequest(BaseModel):
+    user_id: UUID
+    role: str = "co-author"
+    author_order: int = 99
+    author_name: Optional[str] = None
+    author_affiliation: Optional[str] = None
+    author_email: Optional[str] = None
+
+@router.post("/{article_id}/authors")
+async def add_article_author(
+    article_id: UUID,
+    request: AddAuthorRequest,
+    current_user: Optional[UserResponse] = Depends(get_optional_current_user),
+    db = Depends(get_database)
+):
+    """Add author to article (admin only)"""
+    try:
+        # Insert into article_authors table
+        query = """
+        INSERT INTO article_authors (
+            article_id, user_id, role, author_order, 
+            author_name, author_affiliation, author_email, 
+            added_by, added_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+        ON CONFLICT (article_id, user_id) DO UPDATE SET
+            role = EXCLUDED.role,
+            author_order = EXCLUDED.author_order,
+            author_name = EXCLUDED.author_name,
+            author_affiliation = EXCLUDED.author_affiliation,
+            author_email = EXCLUDED.author_email
+        RETURNING id
+        """
+        
+        result = await db.fetch_one(query, 
+            article_id, request.user_id, request.role, request.author_order,
+            request.author_name, request.author_affiliation, request.author_email,
+            current_user.id if current_user else None
+        )
+        
+        return {"message": "Author added successfully", "author_id": result["id"]}
+        
+    except Exception as e:
+        logger.error(f"Error adding author to article {article_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to add author"
+        )
+
+@router.delete("/{article_id}/authors/{user_id}")
+async def remove_article_author(
+    article_id: UUID,
+    user_id: UUID,
+    current_user: Optional[UserResponse] = Depends(get_optional_current_user),
+    db = Depends(get_database)
+):
+    """Remove author from article (admin only)"""
+    try:
+        # Check if author exists first
+        check_query = "SELECT COUNT(*) FROM article_authors WHERE article_id = $1 AND user_id = $2"
+        count = await db.fetch_val(check_query, article_id, user_id)
+        
+        if count == 0:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Author not found in this article"
+            )
+            
+        # Delete the author
+        delete_query = "DELETE FROM article_authors WHERE article_id = $1 AND user_id = $2"
+        await db.execute_query(delete_query, article_id, user_id)
+        
+        return {"message": "Author removed successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error removing author from article {article_id}: {e}")
+        import traceback
+        logger.error(f"Full error: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to remove author: {str(e)}"
         )

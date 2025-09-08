@@ -13,16 +13,20 @@ logging.basicConfig(
 async def startup():
     """Initialize all connections on startup"""
     try:
-        # Initialize database connection
-        await db.connect()
+        # Skip database connection if using dummy URL
+        if settings.DATABASE_URL and "dummy" not in settings.DATABASE_URL.lower():
+            # Initialize database connection
+            await db.connect()
+            
+            # Test database connection
+            result = await db.fetch_val("SELECT 1")
+            if result == 1:
+                logging.info("Database connection successful")
+        else:
+            logging.info("Skipping database connection - using dummy URL")
         
         # Initialize Supabase client (skip for now due to version compatibility)
         # supabase_client.initialize()
-        
-        # Test database connection
-        result = await db.fetch_val("SELECT 1")
-        if result == 1:
-            logging.info("Database connection successful")
         
         logging.info("All startup tasks completed successfully")
         

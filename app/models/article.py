@@ -82,6 +82,19 @@ class ArticleBase(BaseModel):
     access_level: AccessLevel = AccessLevel.PUBLIC
     is_featured: bool = False
 
+# Minimal article creation - just type and basic info
+class ArticleCreateMinimal(BaseModel):
+    article_type_id: int  # Required - must specify article type
+    title: Optional[str] = Field("Untitled Draft", max_length=500)
+    content: Optional[str] = "Draft content - to be edited"
+    
+    @validator('title')
+    def validate_title(cls, v):
+        if not v or len(v.strip()) == 0:
+            return "Untitled Draft"
+        return v.strip()
+
+# Full article creation for advanced use
 class ArticleCreate(ArticleBase):
     article_type_id: Optional[int] = None
     topic_ids: Optional[List[int]] = []
@@ -169,6 +182,7 @@ class ArticleListItem(BaseModel):
 class ArticleSearchRequest(BaseModel):
     query: Optional[str] = None
     author_query: Optional[str] = None  # Search by author name
+    author_ids: Optional[List[UUID]] = None  # Filter by specific author IDs
     article_type_ids: Optional[List[int]] = []
     topic_ids: Optional[List[int]] = []
     tag_names: Optional[List[str]] = []
@@ -190,6 +204,8 @@ class ArticleSearchResponse(BaseModel):
     page: int
     page_size: int
     total_pages: int
+    user_role: Optional[str] = None  # "admin" or "user" for frontend logic
+
 
 # Admin specific models
 class ArticleAdminUpdate(ArticleUpdate):

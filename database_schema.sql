@@ -100,6 +100,17 @@ CREATE TABLE article_authors (
     PRIMARY KEY (article_id, user_id)
 );
 
+-- Article co-authors table (for Co-Authors Management API)
+CREATE TABLE article_co_authors (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    article_id UUID REFERENCES articles(id) ON DELETE CASCADE NOT NULL,
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL,
+    role VARCHAR(50) DEFAULT 'Co-Author',
+    "order" INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(article_id, user_id)
+);
+
 -- Article topics (Many-to-Many)
 CREATE TABLE article_topics (
     article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
@@ -306,3 +317,20 @@ INSERT INTO topics (name, slug, category) VALUES
 ('Natural Resources', 'natural-resources', 'Environment & Disaster'),
 ('Environment', 'environment', 'Environment & Disaster'),
 ('Disasters', 'disasters', 'Environment & Disaster');
+
+-- ===============================
+-- PERFORMANCE INDEXES
+-- ===============================
+
+-- Critical indexes for performance
+CREATE INDEX CONCURRENTLY idx_articles_status_level ON articles(status, access_level);
+CREATE INDEX CONCURRENTLY idx_articles_published_at ON articles(published_at DESC) WHERE status = 'published';
+CREATE INDEX CONCURRENTLY idx_article_views_daily_unique ON article_views(article_id, ip_address, DATE(created_at));
+
+-- Additional useful indexes
+CREATE INDEX CONCURRENTLY idx_articles_featured ON articles(is_featured, status) WHERE is_featured = true;
+CREATE INDEX CONCURRENTLY idx_articles_created_at ON articles(created_at DESC);
+CREATE INDEX CONCURRENTLY idx_download_logs_user_date ON download_logs(user_id, DATE(created_at));
+CREATE INDEX CONCURRENTLY idx_article_favorites_user ON article_favorites(user_id);
+CREATE INDEX CONCURRENTLY idx_article_co_authors_article ON article_co_authors(article_id);
+CREATE INDEX CONCURRENTLY idx_activity_logs_user_date ON activity_logs(user_id, DATE(created_at));

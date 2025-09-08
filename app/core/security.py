@@ -170,6 +170,18 @@ async def get_current_admin_user(
     
     return current_user
 
+async def get_current_creator_user(
+    current_user: "UserResponse" = Depends(get_current_user)
+) -> "UserResponse":
+    """Get current authenticated user with creator permissions (creator or admin)"""
+    if not (current_user.is_admin or current_user.is_creator):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Creator or admin access required"
+        )
+    
+    return current_user
+
 async def get_optional_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False)),
     db = Depends(get_database)
