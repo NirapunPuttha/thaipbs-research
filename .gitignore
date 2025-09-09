@@ -51,6 +51,11 @@ new_server.log
 ehthumbs.db
 Thumbs.db
 
+# MinIO Data & Binary
+minio-data/
+bin/minio
+bin/*.exe
+
 # Uploads and temporary files
 uploads/
 downloaded_image.jpg

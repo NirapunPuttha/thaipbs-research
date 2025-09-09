@@ -14,6 +14,7 @@ from app.core.database import DatabaseManager
 from app.utils.image_processor import image_processor
 from app.models.user import UserResponse
 from app.models.article import ArticleFileResponse, FileType
+from app.services.minio_service import minio_service
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,65 @@ class FileService:
         self.db = db
         self.upload_dir = Path(settings.UPLOAD_DIR) if hasattr(settings, 'UPLOAD_DIR') else Path("uploads")
         self.upload_dir.mkdir(parents=True, exist_ok=True)
+        self.use_minio = settings.FILE_STORAGE_TYPE == "minio"
+    
+    async def _save_file_to_storage(
+        self, 
+        file_data: bytes, 
+        filename: str, 
+        folder: str, 
+        content_type: str = None
+    ) -> Tuple[str, str, str]:
+        """
+        Save file to either MinIO or local storage
+        Returns: (storage_type, file_path_or_object_name, public_url)
+        """
+        if self.use_minio:
+            # Save to MinIO
+            object_name = minio_service.generate_object_name(filename, folder)
+            success, public_url = await minio_service.upload_file(
+                file_data, object_name, content_type
+            )
+            
+            if not success:
+                raise HTTPException(status_code=500, detail="Failed to upload to MinIO")
+            
+            return "minio", object_name, public_url
+        else:
+            # Save to local storage (existing logic)
+            file_extension = Path(filename).suffix.lower()
+            unique_filename = f"{uuid4()}{file_extension}"
+            
+            # Create folder structure
+            folder_path = self.upload_dir / folder
+            folder_path.mkdir(parents=True, exist_ok=True)
+            
+            file_path = folder_path / unique_filename
+            
+            # Save file
+            with open(file_path, 'wb') as f:
+                f.write(file_data)
+            
+            # Generate relative URL
+            relative_path = f"{folder}/{unique_filename}"
+            public_url = f"/api/v1/files/uploads/{relative_path}"
+            
+            return "local", str(file_path), public_url
+    
+    async def _delete_file_from_storage(self, storage_type: str, file_path_or_object: str) -> bool:
+        """Delete file from storage based on storage type"""
+        if storage_type == "minio":
+            return await minio_service.delete_file(file_path_or_object)
+        else:
+            # Delete local file
+            try:
+                if os.path.exists(file_path_or_object):
+                    os.remove(file_path_or_object)
+                    return True
+                return False
+            except Exception as e:
+                logger.error(f"Failed to delete local file {file_path_or_object}: {e}")
+                return False
     
     async def upload_profile_image(self, user_id: UUID, file: UploadFile) -> UserResponse:
         """
@@ -45,21 +105,42 @@ class FileService:
                 raise HTTPException(status_code=404, detail="User not found")
             
             # Delete old profile image if exists
-            if current_user.get('profile_image_path'):
-                await image_processor.delete_profile_image(current_user['profile_image_path'])
+            old_storage_type = current_user.get('profile_storage_type', 'local')
+            old_file_path = current_user.get('profile_image_path')
+            old_minio_object = current_user.get('profile_image_minio_object')
             
-            # Process new image
-            file_path, public_url = await image_processor.process_profile_image(
-                file_content, 
-                file.filename or "profile_image"
-            )
+            if old_storage_type == 'minio' and old_minio_object:
+                await self._delete_file_from_storage('minio', old_minio_object)
+            elif old_storage_type == 'local' and old_file_path:
+                await image_processor.delete_profile_image(old_file_path)
+            
+            # Process and save image
+            if self.use_minio:
+                # Process image and save to MinIO
+                processed_content, _ = self._process_image(file_content, file.filename or "profile_image")
+                storage_type, minio_object, public_url = await self._save_file_to_storage(
+                    processed_content, file.filename or "profile_image.jpg", "profiles", file.content_type
+                )
+                file_path = None  # MinIO doesn't use local file paths
+            else:
+                # Use existing image processor for local storage
+                file_path, public_url = await image_processor.process_profile_image(
+                    file_content, file.filename or "profile_image"
+                )
+                storage_type = "local"
+                minio_object = None
             
             # Update user record
-            updated_user = await self._update_user_profile_image(user_id, file_path, public_url)
+            updated_user = await self._update_user_profile_image(
+                user_id, file_path, public_url, storage_type, minio_object
+            )
             
             if not updated_user:
                 # Clean up uploaded file if database update failed
-                await image_processor.delete_profile_image(file_path)
+                if storage_type == 'minio' and minio_object:
+                    await self._delete_file_from_storage('minio', minio_object)
+                elif file_path:
+                    await image_processor.delete_profile_image(file_path)
                 raise HTTPException(status_code=500, detail="Failed to update user profile")
             
             logger.info(f"Profile image uploaded for user {user_id}: {public_url}")
@@ -107,7 +188,8 @@ class FileService:
         query = """
         SELECT id, email, username, first_name, last_name, level, is_admin, 
                is_active, download_count, detailed_info_submitted, 
-               profile_image_url, profile_image_path, created_at, updated_at
+               profile_image_url, profile_image_path, profile_image_minio_object,
+               profile_storage_type, created_at, updated_at
         FROM users 
         WHERE id = $1 AND is_active = true
         """
@@ -115,18 +197,27 @@ class FileService:
         row = await self.db.fetch_one(query, user_id)
         return dict(row) if row else None
     
-    async def _update_user_profile_image(self, user_id: UUID, file_path: Optional[str], public_url: Optional[str]) -> Optional[dict]:
+    async def _update_user_profile_image(
+        self, 
+        user_id: UUID, 
+        file_path: Optional[str], 
+        public_url: Optional[str],
+        storage_type: str = 'local',
+        minio_object: Optional[str] = None
+    ) -> Optional[dict]:
         """Update user profile image in database"""
         query = """
         UPDATE users 
-        SET profile_image_path = $1, profile_image_url = $2, updated_at = NOW()
-        WHERE id = $3
+        SET profile_image_path = $1, profile_image_url = $2, profile_storage_type = $3,
+            profile_image_minio_object = $4, updated_at = NOW()
+        WHERE id = $5
         RETURNING id, email, username, first_name, last_name, level, is_admin, 
                   is_active, download_count, detailed_info_submitted,
-                  profile_image_url, profile_image_path, created_at, updated_at
+                  profile_image_url, profile_image_path, profile_image_minio_object,
+                  profile_storage_type, created_at, updated_at
         """
         
-        row = await self.db.fetch_one(query, file_path, public_url, user_id)
+        row = await self.db.fetch_one(query, file_path, public_url, storage_type, minio_object, user_id)
         return dict(row) if row else None
     
     # Article file management methods

@@ -14,6 +14,8 @@ from app.services.file_service import FileService
 from app.services.user_profile_service import UserProfileService
 from app.services.activity_service import ActivityService, ActivityLogger
 from app.utils.image_processor import image_processor
+from app.services.minio_service import minio_service
+from app.core.config import settings
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -185,11 +187,66 @@ async def download_file(
     current_user: Optional[UserResponse] = Depends(get_optional_current_user),
     db = Depends(get_database)
 ):
-    """Download file (requires login for PDF files) - automatically logs downloads"""
+    """Download file (requires login for PDF files) - supports both MinIO and local storage"""
     try:
-        from app.core.config import settings
+        from fastapi.responses import RedirectResponse
         
-        # Construct full file path
+        # Check if it's a MinIO object path
+        if settings.FILE_STORAGE_TYPE == "minio" and (
+            file_path.startswith("profiles/") or 
+            file_path.startswith("articles/") or 
+            file_path.startswith("covers/")
+        ):
+            # Generate presigned URL for MinIO
+            presigned_url = await minio_service.generate_presigned_url(file_path)
+            
+            if presigned_url:
+                # Check authentication for PDFs
+                if file_path.endswith('.pdf') and not current_user:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Login required for PDF download"
+                    )
+                
+                # Log download for MinIO files
+                if current_user:
+                    try:
+                        file_service = FileService(db)
+                        file_info = await file_service.get_file_by_path(file_path)
+                        
+                        profile_service = UserProfileService(db)
+                        client_ip = request.client.host if request.client else "unknown"
+                        
+                        file_id = file_info.id if file_info else UUID("00000000-0000-0000-0000-000000000000")
+                        article_id = file_info.article_id if file_info else None
+                        file_name = Path(file_path).name
+                        file_type = Path(file_path).suffix.lower().replace('.', '') or 'unknown'
+                        
+                        # Get file info from MinIO
+                        minio_info = await minio_service.get_file_info(file_path)
+                        file_size = minio_info['size'] if minio_info else 0
+                        
+                        await profile_service.log_file_download(
+                            user_id=current_user.id,
+                            file_id=file_id,
+                            article_id=article_id,
+                            file_name=file_name,
+                            file_type=file_type,
+                            file_size=file_size,
+                            ip_address=client_ip
+                        )
+                    except Exception as log_error:
+                        logger.warning(f"Failed to log MinIO download: {log_error}")
+                
+                # Redirect to presigned URL
+                return RedirectResponse(url=presigned_url, status_code=302)
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="File not found in MinIO"
+                )
+        
+        # Fallback to local file serving
         full_path = Path(settings.UPLOAD_DIR) / file_path
         
         if not full_path.exists():
@@ -515,4 +572,95 @@ async def get_article_image(filename: str):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to serve article image"
+        )
+
+# MinIO specific endpoints
+@router.get("/minio/presigned-url/{object_name:path}")
+async def get_presigned_url(
+    object_name: str,
+    current_user: UserResponse = Depends(get_current_user)
+):
+    """Generate presigned URL for MinIO object (authenticated users only)"""
+    try:
+        if settings.FILE_STORAGE_TYPE != "minio":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="MinIO is not enabled"
+            )
+        
+        # Check if object exists
+        exists = await minio_service.file_exists(object_name)
+        if not exists:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="File not found"
+            )
+        
+        # Generate presigned URL
+        presigned_url = await minio_service.generate_presigned_url(object_name)
+        
+        if not presigned_url:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to generate presigned URL"
+            )
+        
+        return {
+            "object_name": object_name,
+            "presigned_url": presigned_url,
+            "expires_in": "7 days"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating presigned URL for {object_name}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate presigned URL"
+        )
+
+@router.get("/minio/upload-url/{folder}/{filename}")
+async def get_upload_presigned_url(
+    folder: str,
+    filename: str,
+    current_user: UserResponse = Depends(get_current_admin_user)
+):
+    """Generate presigned URL for MinIO file upload (admin only)"""
+    try:
+        if settings.FILE_STORAGE_TYPE != "minio":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="MinIO is not enabled"
+            )
+        
+        # Generate object name
+        object_name = minio_service.generate_object_name(filename, folder)
+        
+        # Generate presigned upload URL
+        from datetime import timedelta
+        upload_url = await minio_service.generate_upload_presigned_url(
+            object_name, expires=timedelta(hours=1)
+        )
+        
+        if not upload_url:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to generate upload URL"
+            )
+        
+        return {
+            "object_name": object_name,
+            "upload_url": upload_url,
+            "expires_in": "1 hour",
+            "public_url": f"{settings.minio_base_url}/{object_name}"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating upload URL for {folder}/{filename}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate upload URL"
         )

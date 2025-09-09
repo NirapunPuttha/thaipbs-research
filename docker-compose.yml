@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  # Thai PBS Research API
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Database
+      - DATABASE_URL=${DATABASE_URL:-postgresql://postgres:password@db:5432/thaipbs_research}
+      
+      # MinIO Configuration (point to local MinIO service)
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=thaipbs_admin
+      - MINIO_SECRET_KEY=TpbS!R3s34rch@M1n10#2024$
+      - MINIO_SECURE=false
+      - MINIO_BUCKET_NAME=research-file
+      - FILE_STORAGE_TYPE=minio
+      
+      # Other configs
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-your-secret-key}
+      - ENVIRONMENT=production
+      
+    depends_on:
+      - db
+      - minio
+    volumes:
+      - ./uploads:/app/uploads  # Fallback for local files
+    restart: unless-stopped
+
+  # MinIO Object Storage
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"  # API
+      - "9001:9001"  # Console
+    environment:
+      - MINIO_ROOT_USER=thaipbs_admin
+      - MINIO_ROOT_PASSWORD=TpbS!R3s34rch@M1n10#2024$
+    volumes:
+      - ./minio-data:/data
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # PostgreSQL Database
+  db:
+    image: postgres:15
+    environment:
+      - POSTGRES_DB=thaipbs_research
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/database_schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ./sql/migration_minio_support.sql:/docker-entrypoint-initdb.d/02-minio-support.sql
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

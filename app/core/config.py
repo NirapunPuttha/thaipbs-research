@@ -50,6 +50,21 @@ class Settings(BaseSettings):
     
     # Admin
     INITIAL_ADMIN_EMAIL: Optional[str] = os.getenv("INITIAL_ADMIN_EMAIL")
+    
+    # MinIO Configuration
+    MINIO_ENDPOINT: str = os.getenv("MINIO_ENDPOINT", "localhost:9000")
+    MINIO_ACCESS_KEY: str = os.getenv("MINIO_ACCESS_KEY", "admin")
+    MINIO_SECRET_KEY: str = os.getenv("MINIO_SECRET_KEY", "password123")
+    MINIO_SECURE: bool = os.getenv("MINIO_SECURE", "false").lower() == "true"
+    MINIO_BUCKET_NAME: str = os.getenv("MINIO_BUCKET_NAME", "research-file")
+    
+    # File Storage Configuration
+    FILE_STORAGE_TYPE: str = os.getenv("FILE_STORAGE_TYPE", "local")  # "local" or "minio"
+    
+    @property
+    def minio_base_url(self) -> str:
+        protocol = "https" if self.MINIO_SECURE else "http"
+        return f"{protocol}://{self.MINIO_ENDPOINT}/{self.MINIO_BUCKET_NAME}"
 
     class Config:
         env_file = ".env"

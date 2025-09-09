@@ -1,0 +1,89 @@
+# Multi-stage Dockerfile for Cloud Run with embedded MinIO
+# This includes both API and MinIO in the same container
+
+FROM --platform=linux/amd64 python:3.11-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies including wget for MinIO download
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    libpq-dev \
+    curl \
+    wget \
+    supervisor \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create MinIO directories
+RUN mkdir -p /app/minio-data /app/bin
+
+# Download MinIO binary
+RUN wget -O /app/bin/minio https://dl.min.io/server/minio/release/linux-amd64/minio \
+    && chmod +x /app/bin/minio
+
+# Copy requirements first for better Docker layer caching
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY app/ ./app/
+COPY main.py .
+COPY sql/ ./sql/
+
+# Copy MinIO startup scripts
+COPY bin/start-minio-linux.sh ./bin/
+RUN chmod +x ./bin/start-minio-linux.sh
+
+# Create uploads directory for fallback
+RUN mkdir -p uploads
+
+# Create supervisor configuration for running both services
+RUN cat > /etc/supervisor/conf.d/supervisord.conf << 'EOF'
+[supervisord]
+nodaemon=true
+user=root
+logfile=/tmp/supervisord.log
+pidfile=/tmp/supervisord.pid
+
+[program:minio]
+command=/app/bin/minio server /app/minio-data --console-address :9001
+directory=/app
+autostart=true
+autorestart=true
+stdout_logfile=/tmp/minio.log
+stderr_logfile=/tmp/minio.log
+environment=MINIO_ROOT_USER="thaipbs_admin",MINIO_ROOT_PASSWORD="TpbS!R3s34rch@M1n10#2024$"
+
+[program:api]
+command=uvicorn main:app --host 0.0.0.0 --port 8000
+directory=/app
+autostart=true
+autorestart=true
+stdout_logfile=/tmp/api.log
+stderr_logfile=/tmp/api.log
+environment=PYTHONPATH="/app",FILE_STORAGE_TYPE="minio",MINIO_ENDPOINT="localhost:9000"
+EOF
+
+# Set environment variables for Cloud Run
+ENV PYTHONPATH=/app
+ENV PORT=8000
+ENV FILE_STORAGE_TYPE=minio
+ENV MINIO_ENDPOINT=localhost:9000
+ENV MINIO_ACCESS_KEY=thaipbs_admin
+ENV MINIO_SECRET_KEY=TpbS!R3s34rch@M1n10#2024$
+ENV MINIO_SECURE=false
+ENV MINIO_BUCKET_NAME=research-file
+
+# Expose ports (Cloud Run will use PORT from env)
+EXPOSE 8000 9000 9001
+
+# Health check for the API
+HEALTHCHECK --interval=30s --timeout=30s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Start supervisor to manage both MinIO and API
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
